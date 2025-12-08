@@ -1,12 +1,14 @@
 import type { PlaygroundCapability } from '@/config/playgroundInstructions'
 import { AIService, type ChatMessage } from '@/services/aiService'
 import type { ProviderConfig } from '@/stores/settingsStore'
+import type { MessageAttachment } from '@/stores/promptStore'
 
 export interface PlaygroundMessage {
   id: string
   role: 'user' | 'assistant' | 'system'
   content: string
   timestamp: number
+  attachments?: MessageAttachment[]
 }
 
 export interface PlaygroundAIOptions {
@@ -56,7 +58,8 @@ export class PlaygroundAIService {
     aiMessages.push(
       ...messages.map((msg) => ({
         role: (msg.role === 'assistant' ? 'assistant' : 'user') as ChatMessage['role'],
-        content: msg.content
+        content: msg.content,
+        attachments: msg.attachments
       }))
     )
 

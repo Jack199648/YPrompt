@@ -7,6 +7,7 @@ import { PlaygroundAIService } from '@/services/playground/aiPlaygroundService'
 import { useSettingsStore } from '@/stores/settingsStore'
 import { useNotificationStore } from '@/stores/notificationStore'
 import { useNavigationStore } from '@/stores/navigationStore'
+import { copyToClipboard } from '@/utils/clipboardUtils'
 import { ChevronDown } from 'lucide-vue-next'
 
 export default {
@@ -58,6 +59,16 @@ export default {
               @clear="handleClear"
               @toggle-stream="toggleStreamMode"
               @open-system-prompt="$emit('open-system-prompt')"
+              @start-edit="startEditMessage"
+              @save-edit="(messageId) => saveEditMessage(messageId)"
+              @cancel-edit="cancelEditMessage"
+              @delete-message="deleteMessage"
+              @copy-message="copyMessage"
+              @regenerate-message="handleRegenerateMessage"
+              @resend="handleResendAfterEdit"
+              @resend-user="handleResendUserMessage"
+              @edit-input="updateEditingContent"
+              @edit-keydown="handleEditKeydown"
             />
           </div>
         </div>
@@ -127,9 +138,22 @@ export default {
       return { provider, model }
     }
 
+    const cloneAttachments = (attachments = []) => attachments.map((att) => ({ ...att }))
+
+    const buildConversationMessages = (sourceMessages) => {
+      return sourceMessages.map((msg) => ({
+        id: msg.id,
+        role: msg.role === 'model' ? 'assistant' : 'user',
+        content: msg.text,
+        timestamp: msg.timestamp,
+        attachments: msg.attachments ? cloneAttachments(msg.attachments) : undefined
+      }))
+    }
+
     const handleClear = () => {
       messages.value = []
       currentArtifact.value = null
+      isStreaming.value = false
     }
 
     const toggleStreamMode = () => {
@@ -137,9 +161,91 @@ export default {
       settingsStore.saveSettings()
     }
 
+    const startEditMessage = (messageId) => {
+      const target = messages.value.find((msg) => msg.id === messageId)
+      if (!target) return
+      target.isEditing = true
+      target.editingText = target.text
+    }
+
+    const updateEditingContent = ({ messageId, value }) => {
+      const target = messages.value.find((msg) => msg.id === messageId)
+      if (!target) return
+      target.editingText = value
+    }
+
+    const cancelEditMessage = (messageId) => {
+      const target = messages.value.find((msg) => msg.id === messageId)
+      if (!target) return
+      target.isEditing = false
+      target.editingText = undefined
+    }
+
+    const saveEditMessage = (messageId) => {
+      const target = messages.value.find((msg) => msg.id === messageId)
+      if (!target || !target.isEditing) {
+        return false
+      }
+      const newContent = target.editingText ? target.editingText.trim() : ''
+      if (!newContent) {
+        notificationStore.warning('消息内容不能为空')
+        return false
+      }
+      target.text = newContent
+      target.displayText = undefined
+      target.isEditing = false
+      target.editingText = undefined
+      target.timestamp = Date.now()
+      return true
+    }
+
+    const deleteMessage = (messageId) => {
+      const idx = messages.value.findIndex((msg) => msg.id === messageId)
+      if (idx === -1) return
+      if (window.confirm('确定要删除这条消息吗？删除后该消息将不会参与继续的对话。')) {
+        messages.value.splice(idx, 1)
+      }
+    }
+
+    const copyMessage = async (messageId) => {
+      const target = messages.value.find((msg) => msg.id === messageId)
+      if (!target) return
+      const content = (target.displayText || target.text || '').trim()
+      if (!content) {
+        notificationStore.warning('没有可复制的内容')
+        return
+      }
+      try {
+        await copyToClipboard(content)
+        notificationStore.success('已复制到剪贴板')
+      } catch (error) {
+        notificationStore.error('复制失败，请稍后重试')
+      }
+    }
+
+    const handleEditKeydown = ({ messageId, event }) => {
+      if (event.key === 'Enter' && event.ctrlKey) {
+        event.preventDefault()
+        saveEditMessage(messageId)
+      } else if (event.key === 'Escape') {
+        event.preventDefault()
+        cancelEditMessage(messageId)
+      }
+    }
+
     const handleSend = async (payload) => {
       const text = payload?.text?.trim()
-      if (!text) return
+      const attachments = payload?.attachments || []
+      if (!text) {
+        if (attachments.length > 0) {
+          notificationStore.warning('请输入消息内容，不能只发送附件')
+        }
+        return
+      }
+      if (isStreaming.value) {
+        notificationStore.warning('AI 正在响应，请稍候')
+        return
+      }
 
       const providerInfo = ensureProvider()
       if (!providerInfo) return
@@ -148,28 +254,24 @@ export default {
         id: Date.now().toString(),
         role: 'user',
         text,
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        attachments: attachments.length ? cloneAttachments(attachments) : undefined
       }
       messages.value.push(userMessage)
 
+      const conversationHistory = buildConversationMessages(messages.value)
+
       isStreaming.value = true
       const aiMsgId = `${Date.now()}_ai`
-      const aiMessageIdx =
-        messages.value.push({
-          id: aiMsgId,
-          role: 'model',
-          text: '',
-          displayText: '',
-          isStreaming: true,
-          timestamp: Date.now()
-        }) - 1
-
-      const payloadMessages = messages.value.map((msg) => ({
-        id: msg.id,
-        role: msg.role === 'model' ? 'assistant' : 'user',
-        content: msg.text,
-        timestamp: msg.timestamp
-      }))
+      messages.value.push({
+        id: aiMsgId,
+        role: 'model',
+        text: '',
+        displayText: '',
+        isStreaming: true,
+        timestamp: Date.now()
+      })
+      const aiMessageIdx = messages.value.length - 1
 
       const useStream = settingsStore.streamMode
 
@@ -186,7 +288,7 @@ export default {
         }
 
         const response = await aiService.send({
-          messages: payloadMessages,
+          messages: conversationHistory,
           provider: providerInfo.provider,
           modelId: providerInfo.model.id,
           stream: useStream,
@@ -203,13 +305,156 @@ export default {
           }
         }
       } catch (err) {
-        messages.value[aiMessageIdx].text += `\n\n*Error: ${err?.message || err}*`
+        messages.value[aiMessageIdx].text = `${messages.value[aiMessageIdx].text || ''}\n\n*Error: ${err?.message || err}*`
         messages.value[aiMessageIdx].displayText = messages.value[aiMessageIdx].text
       } finally {
         messages.value[aiMessageIdx].isStreaming = false
         messages.value[aiMessageIdx].displayText = messages.value[aiMessageIdx].text
         isStreaming.value = false
       }
+    }
+
+    const handleRegenerateMessage = async (messageId) => {
+      const targetIndex = messages.value.findIndex((msg) => msg.id === messageId)
+      if (targetIndex === -1) return
+      const target = messages.value[targetIndex]
+      if (target.role !== 'model') return
+      if (isStreaming.value) {
+        notificationStore.warning('AI 正在响应，请稍候')
+        return
+      }
+
+      const providerInfo = ensureProvider()
+      if (!providerInfo) return
+
+      const history = buildConversationMessages(messages.value.slice(0, targetIndex))
+      if (history.length === 0) {
+        notificationStore.warning('缺少可用的对话上下文')
+        return
+      }
+
+      isStreaming.value = true
+      target.text = ''
+      target.displayText = ''
+      target.isStreaming = true
+
+      const useStream = settingsStore.streamMode
+
+      try {
+        let accumulated = ''
+        const onChunk = (chunkText) => {
+          accumulated += chunkText
+          target.text = accumulated
+          target.displayText = buildDisplayText(accumulated)
+          const artifact = extractArtifact(accumulated)
+          if (artifact) {
+            currentArtifact.value = artifact
+          }
+        }
+
+        const response = await aiService.send({
+          messages: history,
+          provider: providerInfo.provider,
+          modelId: providerInfo.model.id,
+          stream: useStream,
+          onChunk: useStream ? onChunk : undefined,
+          systemPrompt: props.systemPrompt
+        })
+
+        if (!useStream && typeof response === 'string') {
+          target.text = response
+          target.displayText = response
+          const artifact = extractArtifact(response)
+          if (artifact) {
+            currentArtifact.value = artifact
+          }
+        }
+      } catch (error) {
+        target.text = `${target.text || ''}\n\n*Error: ${error?.message || error}*`
+        target.displayText = target.text
+      } finally {
+        target.isStreaming = false
+        target.displayText = target.text
+        isStreaming.value = false
+      }
+    }
+
+    const handleResendUserMessage = async (messageId) => {
+      const targetIndex = messages.value.findIndex((msg) => msg.id === messageId)
+      if (targetIndex === -1) return
+      const target = messages.value[targetIndex]
+      if (target.role !== 'user') return
+      if (isStreaming.value) {
+        notificationStore.warning('AI 正在响应，请稍候')
+        return
+      }
+
+      const providerInfo = ensureProvider()
+      if (!providerInfo) return
+
+      if (targetIndex < messages.value.length - 1) {
+        messages.value.splice(targetIndex + 1)
+      }
+
+      const history = buildConversationMessages(messages.value)
+
+      isStreaming.value = true
+      const aiMsgId = `${Date.now()}_ai`
+      messages.value.push({
+        id: aiMsgId,
+        role: 'model',
+        text: '',
+        displayText: '',
+        isStreaming: true,
+        timestamp: Date.now()
+      })
+      const aiMessageIdx = messages.value.length - 1
+
+      const useStream = settingsStore.streamMode
+
+      try {
+        let accumulated = ''
+        const onChunk = (chunkText) => {
+          accumulated += chunkText
+          messages.value[aiMessageIdx].text = accumulated
+          messages.value[aiMessageIdx].displayText = buildDisplayText(accumulated)
+          const artifact = extractArtifact(accumulated)
+          if (artifact) {
+            currentArtifact.value = artifact
+          }
+        }
+
+        const response = await aiService.send({
+          messages: history,
+          provider: providerInfo.provider,
+          modelId: providerInfo.model.id,
+          stream: useStream,
+          onChunk: useStream ? onChunk : undefined,
+          systemPrompt: props.systemPrompt
+        })
+
+        if (!useStream && typeof response === 'string') {
+          messages.value[aiMessageIdx].text = response
+          messages.value[aiMessageIdx].displayText = response
+          const artifact = extractArtifact(response)
+          if (artifact) {
+            currentArtifact.value = artifact
+          }
+        }
+      } catch (error) {
+        messages.value[aiMessageIdx].text = `${messages.value[aiMessageIdx].text || ''}\n\n*Error: ${error?.message || error}*`
+        messages.value[aiMessageIdx].displayText = messages.value[aiMessageIdx].text
+      } finally {
+        messages.value[aiMessageIdx].isStreaming = false
+        messages.value[aiMessageIdx].displayText = messages.value[aiMessageIdx].text
+        isStreaming.value = false
+      }
+    }
+
+    const handleResendAfterEdit = async (messageId) => {
+      const saved = saveEditMessage(messageId)
+      if (!saved) return
+      await handleResendUserMessage(messageId)
     }
 
     const toggleChat = () => {
@@ -252,7 +497,17 @@ export default {
       chatExpanded,
       previewExpanded,
       toggleChat,
-      togglePreview
+      togglePreview,
+      startEditMessage,
+      saveEditMessage,
+      cancelEditMessage,
+      deleteMessage,
+      copyMessage,
+      handleRegenerateMessage,
+      handleResendUserMessage,
+      handleResendAfterEdit,
+      updateEditingContent,
+      handleEditKeydown
     }
   }
 }
