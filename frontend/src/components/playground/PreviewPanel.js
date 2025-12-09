@@ -6,6 +6,8 @@ import MindMap from './MindMap.js';
 import mermaid from 'mermaid';
 import * as echarts from 'echarts';
 import * as d3 from 'd3';
+import renderMathInElement from 'katex/contrib/auto-render';
+import 'katex/dist/katex.min.css';
 
 export default {
   name: 'PreviewPanel',
@@ -260,6 +262,7 @@ export default {
                 <!-- Markdown -->
                 <div 
                   v-else-if="artifact && artifact.type === 'markdown'"
+                  ref="markdownPreviewRef"
                   class="w-full h-full bg-white p-8 overflow-y-auto markdown-body preview-markdown"
                   v-html="renderMarkdown(localContent)"
                 ></div>
@@ -353,6 +356,7 @@ export default {
     const mermaidContainerRef = ref(null);
     const echartsRef = ref(null);
     const drawioRef = ref(null);
+    const markdownPreviewRef = ref(null);
     const reloadKey = ref(0); // Key to force re-rendering
     
     // View Modes
@@ -431,6 +435,25 @@ export default {
         addLog('error', errorMsg);
         // Optional: Auto-open console on generic component errors
         // isConsoleOpen.value = true; 
+    };
+
+    const katexDelimiters = [
+      { left: '$$', right: '$$', display: true },
+      { left: '$', right: '$', display: false },
+      { left: '\\(', right: '\\)', display: false },
+      { left: '\\[', right: '\\]', display: true }
+    ];
+
+    const applyLatexRendering = () => {
+      if (props.artifact?.type !== 'markdown' || !markdownPreviewRef.value) return;
+      try {
+        renderMathInElement(markdownPreviewRef.value, {
+          delimiters: katexDelimiters,
+          throwOnError: false
+        });
+      } catch (error) {
+        addLog('warn', `KaTeX Render Error: ${error.message}`);
+      }
     };
 
     // --- HTML Enriched Content ---
@@ -1174,7 +1197,36 @@ export default {
       return clone.querySelector('svg')?.outerHTML || localContent.value;
     };
     const copyCode = () => { navigator.clipboard.writeText(getDisplayCode()); copied.value = true; setTimeout(() => copied.value = false, 2000); };
-    const renderMarkdown = (text) => window.marked ? window.marked.parse(text, { breaks: true, gfm: true }) : text;
+    const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const mathBlockDelimiters = [
+      { start: '$$', end: '$$' },
+      { start: '\\[', end: '\\]' },
+      { start: '\\(', end: '\\)' }
+    ];
+    const createMathPlaceholders = (input) => {
+      const placeholders = [];
+      let processed = input;
+      mathBlockDelimiters.forEach(({ start, end }) => {
+        const pattern = new RegExp(`${escapeRegex(start)}([\\s\\S]*?)${escapeRegex(end)}`, 'g');
+        processed = processed.replace(pattern, (match) => {
+          if (!match.includes('\n')) return match;
+          const token = `MATH_BLOCK_PLACEHOLDER_${placeholders.length}_${Math.random().toString(36).slice(2)}`;
+          placeholders.push({ token, value: match });
+          return token;
+        });
+      });
+      return { processed, placeholders };
+    };
+    const restoreMathPlaceholders = (html, placeholders) => {
+      return placeholders.reduce((acc, { token, value }) => acc.split(token).join(value), html);
+    };
+    const renderMarkdown = (text) => {
+      if (!window.marked) return text;
+      const { processed, placeholders } = createMathPlaceholders(text);
+      let result = window.marked.parse(processed, { breaks: true, gfm: true });
+      if (typeof result !== 'string') result = String(result);
+      return restoreMathPlaceholders(result, placeholders);
+    };
     const refreshIcons = () => { if (window.lucide) window.lucide.createIcons(); };
 
     watch(() => props.artifact, (newVal) => {
@@ -1192,6 +1244,7 @@ export default {
         nextTick(() => {
            if (newVal.type === 'mermaid') renderMermaid();
            if (newVal.type === 'echarts') renderECharts();
+           if (newVal.type === 'markdown') applyLatexRendering();
            // Trigger syntax highlight for JSON view
            if (newVal.type === 'json' && window.hljs) {
                document.querySelectorAll('pre code').forEach((block) => {
@@ -1206,6 +1259,9 @@ export default {
       if (props.artifact?.type === 'drawio' && drawioInitialized.value && !isUpdatingFromDrawio.value && activeTab.value === 'preview') {
            sendDrawioXml(newVal);
       }
+      if (props.artifact?.type === 'markdown' && activeTab.value === 'preview') {
+           nextTick(applyLatexRendering);
+      }
     });
 
     watch(activeTab, (newTab) => {
@@ -1214,6 +1270,7 @@ export default {
              if (props.artifact?.type === 'mermaid') renderMermaid();
              if (props.artifact?.type === 'echarts') renderECharts();
              if (props.artifact?.type === 'drawio' && drawioInitialized.value) { sendDrawioXml(localContent.value); }
+             if (props.artifact?.type === 'markdown') applyLatexRendering();
              if (props.artifact?.type === 'json' && window.hljs) {
                document.querySelectorAll('pre code').forEach((block) => {
                    window.hljs.highlightElement(block);
@@ -1240,7 +1297,7 @@ export default {
         handleSvgMouseDown, handleSvgDoubleClick, handleGlobalMouseMove, handleGlobalMouseUp,
         updateElementStyle, updateTextContent, duplicateSelected, deleteSelected,
         addText, addRect, addCircle, addLine, addArrow, deselectAll,
-        svgWrapper, mermaidRef, mermaidContainerRef, echartsRef, drawioRef, currentTransform, mainContainer,
+        svgWrapper, mermaidRef, mermaidContainerRef, echartsRef, drawioRef, markdownPreviewRef, currentTransform, mainContainer,
         undo, redo, handleKeydown, historyIndex, history,
         selectionBox, inlineEdit, inlineInputRef, commitInlineEdit, handleInlineInputKeydown,
         deviceMode, toggleFullscreen, isFullscreen, downloadArtifact,
